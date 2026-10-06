@@ -23,7 +23,8 @@ let sb = null;            // Supabase-client
 let session = null;       // huidige aanmelding
 let channel = null;       // realtime-kanaal
 let config = emptyConfig();
-let day = emptyDay();
+let rounds = [];        // rondes: één per golfbaan/speeldag, met wedstrijden en side contests
+let currentRoundId = localGet("golf-round");
 let loaded = false;
 let pendingRender = false;
 let armed = null;         // verwijderknop die op bevestiging wacht
@@ -41,7 +42,12 @@ function isNum(v) { return typeof v === "number" && Number.isFinite(v); }
 function fmt1(n) { return isNum(n) ? (Math.round(n * 10) / 10).toFixed(1).replace(".", ",") : "–"; }
 function fmtHcp(n) { if (!isNum(n)) return "–"; return n < 0 ? "+" + fmt1(-n) : fmt1(n); }
 function emptyConfig() { return { teams: [{ id: "a", name: "Team A", players: [] }, { id: "b", name: "Team B", players: [] }], courses: [] }; }
-function emptyDay() { return { courseId: null, matches: [] }; }
+function localGet(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
+function localSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+function todayIso() { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
+function fmtDate(iso) { if (!iso) return ""; const d = new Date(iso + "T00:00:00"); return isNaN(d) ? iso : d.toLocaleDateString("nl-BE", { day: "numeric", month: "short", year: "numeric" }); }
+function fmtPts(n) { if (!isNum(n)) return "0"; const r = Math.round(n * 10) / 10; return Number.isInteger(r) ? String(r) : r.toFixed(1).replace(".", ","); }
+const CONTESTS = [{ k: "ld", label: "Longest drive", pts: "ptsLd" }, { k: "ntp1", label: "Nearest to the pin 1", pts: "ptsNtp" }, { k: "ntp2", label: "Nearest to the pin 2", pts: "ptsNtp" }];
 function setStatus(msg, err) { statusEl.textContent = msg || ""; statusEl.classList.toggle("err", !!err); }
 
 function team(id) { return config.teams.find(t => t.id === id); }
@@ -49,7 +55,11 @@ function allPlayers() { return config.teams.flatMap(t => t.players.map(p => ({ .
 function playerById(id) { return allPlayers().find(p => p.id === id) || null; }
 function courseById(id) { return config.courses.find(c => c.id === id) || null; }
 function findPlayer(pid) { for (const t of config.teams) { const i = t.players.findIndex(p => p.id === pid); if (i >= 0) return { t, i, p: t.players[i] }; } return null; }
-function findMatch(mid) { return day.matches.find(m => m.id === mid); }
+function currentRound() { return rounds.find(r => r.id === currentRoundId) || rounds[rounds.length - 1] || null; }
+function roundById(id) { return rounds.find(r => r.id === id) || null; }
+function findMatch(mid) { for (const r of rounds) { const m = r.matches.find(x => x.id === mid); if (m) return m; } return null; }
+function roundOfMatch(mid) { return rounds.find(r => r.matches.some(m => m.id === mid)) || null; }
+function roundLabel(r) { const c = courseById(r.courseId); return `${c ? (c.name || "Naamloze baan") : "Geen baan gekozen"} · ${fmtDate(r.date)}`; }
 
 /* ============================================================
    Opstart & aanmelden
@@ -74,7 +84,7 @@ async function start() {
 
 async function onSignedIn() {
   // Ruim de tokens uit de adresbalk op na het klikken op de inloglink.
-  if (/access_token|refresh_token|type=/.test(location.hash)) history.replaceState(null, "", location.pathname + "#wedstrijden");
+  if (/access_token|refresh_token|type=/.test(location.hash)) history.replaceState(null, "", location.pathname + "#overzicht");
   tabsEl.hidden = false;
   renderAccount();
   setStatus("Gegevens laden…");
@@ -88,7 +98,7 @@ async function onSignedIn() {
 
 function onSignedOut() {
   if (channel) { sb.removeChannel(channel); channel = null; }
-  loaded = false; config = emptyConfig(); day = emptyDay();
+  loaded = false; config = emptyConfig(); rounds = [];
   tabsEl.hidden = true;
   renderAccount();
   setStatus("");
@@ -169,12 +179,18 @@ async function loadAll() {
     sb.from("players").select("id,team_id,name,hcp").order("created_at"),
     sb.from("courses").select("id,name,par").order("created_at"),
     sb.from("course_tees").select("course_id,tee,slope,course_rating"),
-    sb.from("match_day").select("course_id").eq("id", 1).maybeSingle(),
-    sb.from("matches").select("id,mode,formula,pct,slots").order("created_at")
+    sb.from("rounds").select("id,course_id,played_on,points_match,points_ld,points_ntp").order("played_on").order("created_at"),
+    sb.from("matches").select("id,round_id,mode,formula,pct,slots,result").order("created_at"),
+    sb.from("side_contests").select("round_id,kind,team_id,player_id")
   ]);
   const failed = res.find(r => r.error);
-  if (failed) { setStatus("Gegevens laden is mislukt: " + failed.error.message, true); return; }
-  const [teams, players, courses, tees, dayRow, matches] = res.map(r => r.data);
+  if (failed) {
+    setStatus(/rounds|side_contests|round_id|result/.test(failed.error.message)
+      ? "De database is nog niet bijgewerkt. Voer supabase/migratie-002-rondes-en-punten.sql uit in de SQL Editor van Supabase."
+      : "Gegevens laden is mislukt: " + failed.error.message, true);
+    return;
+  }
+  const [teams, players, courses, tees, roundRows, matches, contests] = res.map(r => r.data);
 
   config = {
     teams: ["a", "b"].map(id => {
@@ -194,7 +210,16 @@ async function loadAll() {
       return { id: c.id, name: c.name, par: toNum(c.par) ?? 72, tees: t };
     })
   };
-  day = { courseId: dayRow ? dayRow.course_id : null, matches: (matches || []).map(normalizeMatch) };
+  rounds = (roundRows || []).map(r => {
+    const c = {};
+    (contests || []).filter(x => x.round_id === r.id).forEach(x => { c[x.kind] = { teamId: x.team_id, playerId: x.player_id }; });
+    return {
+      id: r.id, courseId: r.course_id, date: r.played_on,
+      ptsMatch: toNum(r.points_match) ?? 1, ptsLd: toNum(r.points_ld) ?? 1, ptsNtp: toNum(r.points_ntp) ?? 1,
+      contests: c,
+      matches: (matches || []).filter(m => m.round_id === r.id).map(normalizeMatch)
+    };
+  });
   loaded = true;
   if (statusEl.textContent === "Gegevens laden…") setStatus("");
   requestRender();
@@ -209,7 +234,8 @@ function normalizeMatch(row) {
     const v = (Array.isArray(slots[s]) ? slots[s] : [])[i] || {};
     return { pid: v.pid || null, tee: TEES.some(t => t.k === v.tee) ? v.tee : DEFAULT_TEE };
   });
-  return { id: row.id, mode, formula, pct: isNum(row.pct) ? row.pct : DEFAULT_PCT[formula], a: side("a"), b: side("b") };
+  return { id: row.id, mode, formula, pct: isNum(row.pct) ? row.pct : DEFAULT_PCT[formula], a: side("a"), b: side("b"),
+    result: ["a", "b", "halved"].includes(row.result) ? row.result : null };
 }
 
 /* ============================================================
@@ -227,7 +253,9 @@ async function run(query) {
   setStatus("Opgeslagen.");
   return true;
 }
-const matchRow = m => ({ mode: m.mode, formula: m.formula, pct: m.pct, slots: { a: m.a, b: m.b } });
+const matchRow = m => ({ mode: m.mode, formula: m.formula, pct: m.pct, slots: { a: m.a, b: m.b }, result: m.result });
+const roundRow = r => ({ course_id: r.courseId, played_on: r.date, points_match: r.ptsMatch, points_ld: r.ptsLd, points_ntp: r.ptsNtp });
+const saveRound = r => run(sb.from("rounds").update(roundRow(r)).eq("id", r.id));
 const saveMatch = m => run(sb.from("matches").update(matchRow(m)).eq("id", m.id));
 const saveTee = (c, tee) => run(sb.from("course_tees").upsert(
   { course_id: c.id, tee, slope: c.tees[tee].slope, course_rating: c.tees[tee].cr },
@@ -248,8 +276,9 @@ function calcPlayer(p, tee, course, pct) {
 }
 
 function calcMatch(m) {
-  const course = courseById(day.courseId);
-  if (!course) return { state: "empty", msg: "Kies eerst een golfbaan bovenaan." };
+  const round = roundOfMatch(m.id);
+  const course = round ? courseById(round.courseId) : null;
+  if (!course) return { state: "empty", msg: "Kies eerst een golfbaan voor deze ronde." };
   const rows = [];
   for (const side of ["a", "b"]) {
     for (const s of m[side]) {
@@ -269,13 +298,32 @@ function calcMatch(m) {
   return { state: "ok", rows, tot, diff, receiver: diff > 0 ? "a" : diff < 0 ? "b" : null, course };
 }
 
+/* Punten per ronde: gewonnen wedstrijd = punten voor de winnaar, gelijk = helft voor elk. */
+function roundPoints(r) {
+  const z = () => ({ a: 0, b: 0 });
+  const p = { match: z(), ld: z(), ntp: z(), total: z(), played: 0 };
+  r.matches.forEach(m => {
+    if (m.result === "a" || m.result === "b") { p.match[m.result] += r.ptsMatch; p.played++; }
+    else if (m.result === "halved") { p.match.a += r.ptsMatch / 2; p.match.b += r.ptsMatch / 2; p.played++; }
+  });
+  CONTESTS.forEach(c => { const w = r.contests[c.k]; if (w && (w.teamId === "a" || w.teamId === "b")) p[c.k === "ld" ? "ld" : "ntp"][w.teamId] += r[c.pts]; });
+  ["a", "b"].forEach(t => p.total[t] = p.match[t] + p.ld[t] + p.ntp[t]);
+  return p;
+}
+function allPoints() {
+  const z = () => ({ a: 0, b: 0 });
+  const p = { match: z(), ld: z(), ntp: z(), total: z() };
+  rounds.forEach(r => { const q = roundPoints(r); ["match", "ld", "ntp", "total"].forEach(k => ["a", "b"].forEach(t => p[k][t] += q[k][t])); });
+  return p;
+}
+
 /* ============================================================
    Weergave
    ============================================================ */
-function route() { const r = (location.hash || "").replace("#", ""); return ["wedstrijden", "teams", "banen"].includes(r) ? r : "wedstrijden"; }
+function route() { const r = (location.hash || "").replace("#", ""); return ["overzicht", "wedstrijden", "teams", "banen"].includes(r) ? r : "overzicht"; }
 function isTyping() {
   const a = document.activeElement;
-  return a && main.contains(a) && a.tagName === "INPUT" && ["text", "number", "email"].includes(a.type);
+  return a && main.contains(a) && a.tagName === "INPUT" && ["text", "number", "email", "date"].includes(a.type);
 }
 function requestRender(force) {
   if (isTyping() && !force) { pendingRender = true; return; }
@@ -292,7 +340,7 @@ function render() {
   const r = route();
   document.querySelectorAll("nav.tabs a").forEach(a => a.dataset.route === r ? a.setAttribute("aria-current", "page") : a.removeAttribute("aria-current"));
   if (!loaded) { main.innerHTML = ""; return; }
-  main.innerHTML = r === "teams" ? renderTeams() : r === "banen" ? renderCourses() : renderMatches();
+  main.innerHTML = r === "teams" ? renderTeams() : r === "banen" ? renderCourses() : r === "wedstrijden" ? renderMatches() : renderOverview();
   if (focusKey) { const el = main.querySelector(`[data-fk="${CSS.escape(focusKey)}"]`); if (el) el.focus(); }
 }
 
@@ -354,29 +402,52 @@ function renderMatches() {
     if (!hasPlayers) need.push(`spelers in beide <a href="#teams">teams</a>`);
     return `<h2>Wedstrijden</h2><div class="panel empty-state"><p style="margin:0">Om te beginnen heb je ${need.join(" en ")} nodig.</p></div>`;
   }
-  return `<h2>Wedstrijden</h2>
-  <p class="help">Kies de baan, stel per wedstrijd de spelers, hun tees en het percentage in. Het verschil in strokes verschijnt meteen.</p>
-  <div class="stack">
-    <div class="panel daybar">
-      <div><label class="f" for="day-course">Golfbaan</label>
-        <select id="day-course" data-fk="day-course" data-act="day-course">
-          <option value="">Kies een baan…</option>
-          ${config.courses.map(c => `<option value="${c.id}" ${c.id === day.courseId ? "selected" : ""}>${esc(c.name || "Naamloze baan")} — par ${c.par}</option>`).join("")}
+  const r = currentRound();
+  const bar = `<div class="panel daybar">
+      <div><label class="f" for="round-pick">Ronde</label>
+        <select id="round-pick" data-fk="round-pick" data-act="round-pick" ${rounds.length ? "" : "disabled"}>
+          ${rounds.length ? rounds.slice().reverse().map(x => `<option value="${x.id}" ${r && x.id === r.id ? "selected" : ""}>${esc(roundLabel(x))}</option>`).join("") : `<option>Nog geen rondes</option>`}
         </select></div>
-      <button class="btn primary" data-act="m-add" data-fk="m-add">Wedstrijd toevoegen</button>
-    </div>
-    ${day.matches.length ? day.matches.map((m, i) => renderMatch(m, i)).join("") : `<div class="panel empty-state"><p style="margin:0">Nog geen wedstrijden. Voeg er een toe om de strokes te berekenen.</p></div>`}
+      <button class="btn primary" data-act="r-add" data-fk="r-add">Nieuwe ronde</button>
+    </div>`;
+  if (!r) return `<h2>Wedstrijden</h2>
+    <p class="help">Een ronde is één speeldag op één golfbaan. Binnen een ronde stel je de wedstrijden samen.</p>
+    <div class="stack">${bar}<div class="panel empty-state"><p style="margin:0">Nog geen rondes. Maak er een aan om wedstrijden samen te stellen.</p></div></div>`;
+  return `<h2>Wedstrijden</h2>
+  <p class="help">Een ronde is één speeldag op één golfbaan. Stel per wedstrijd de spelers, hun tees en het percentage in; het verschil in strokes verschijnt meteen. Uitslagen vul je in op <a href="#overzicht">Overzicht</a>.</p>
+  <div class="stack">
+    ${bar}
+    <section class="panel" aria-label="Instellingen van de ronde">
+      <div class="round-grid">
+        <div class="span2"><label class="f" for="r-course">Golfbaan</label>
+          <select id="r-course" data-fk="r-course" data-act="r-course" data-rid="${r.id}">
+            <option value="">Kies een baan…</option>
+            ${config.courses.map(c => `<option value="${c.id}" ${c.id === r.courseId ? "selected" : ""}>${esc(c.name || "Naamloze baan")} — par ${c.par}</option>`).join("")}
+          </select></div>
+        <div><label class="f" for="r-date">Datum</label><input type="date" id="r-date" data-fk="r-date" data-act="r-date" data-rid="${r.id}" value="${esc(r.date || "")}"></div>
+        <div><label class="f" for="r-pm">Punten per wedstrijd</label><input type="number" min="0" step="0.5" id="r-pm" data-fk="r-pm" data-act="r-pts" data-field="ptsMatch" data-rid="${r.id}" value="${r.ptsMatch}"></div>
+        <div><label class="f" for="r-pl">Punten longest drive</label><input type="number" min="0" step="0.5" id="r-pl" data-fk="r-pl" data-act="r-pts" data-field="ptsLd" data-rid="${r.id}" value="${r.ptsLd}"></div>
+        <div><label class="f" for="r-pn">Punten per nearest to the pin</label><input type="number" min="0" step="0.5" id="r-pn" data-fk="r-pn" data-act="r-pts" data-field="ptsNtp" data-rid="${r.id}" value="${r.ptsNtp}"></div>
+      </div>
+      <div class="round-foot">
+        <span class="note">${r.matches.length} ${r.matches.length === 1 ? "wedstrijd" : "wedstrijden"} in deze ronde</span>
+        <button class="btn ghost danger ${armed === "r-" + r.id ? "armed" : ""}" data-act="r-del" data-rid="${r.id}" data-fk="rd-${r.id}">${armed === "r-" + r.id ? "Zeker? Ook alle wedstrijden en uitslagen gaan weg" : "Ronde verwijderen"}</button>
+      </div>
+    </section>
+    ${r.matches.length ? r.matches.map((m, i) => renderMatch(m, i, r)).join("") : `<div class="panel empty-state"><p style="margin:0">Nog geen wedstrijden in deze ronde.</p></div>`}
+    <div><button class="btn primary" data-act="m-add" data-rid="${r.id}" data-fk="m-add">Wedstrijd toevoegen</button></div>
     <p class="note">Course handicap = handicap index × slope ÷ 113 + (course rating − par), afgerond. Playing handicap = course handicap × percentage, afgerond. Het team met de hoogste totale playing handicap krijgt het verschil aan strokes.</p>
   </div>`;
 }
 
 function usedElsewhere(m, side, idx) {
   const set = new Set();
-  day.matches.forEach(o => ["a", "b"].forEach(s => o[s].forEach((sl, j) => { if (sl.pid && !(o.id === m.id && s === side && j === idx)) set.add(sl.pid); })));
+  const r = roundOfMatch(m.id);
+  (r ? r.matches : []).forEach(o => ["a", "b"].forEach(s => o[s].forEach((sl, j) => { if (sl.pid && !(o.id === m.id && s === side && j === idx)) set.add(sl.pid); })));
   return set;
 }
 
-function renderMatch(m, i) {
+function renderMatch(m, i, round) {
   const side = (sid, t) => {
     const c = sid === "a" ? "var(--teamA)" : "var(--teamB)";
     return `<div class="side" style="--c:${c}"><h4>${esc(t.name)}</h4>
@@ -392,7 +463,7 @@ function renderMatch(m, i) {
     </div>`;
   };
   return `<section class="panel match" aria-label="Wedstrijd ${i + 1}">
-    <div class="match-top"><h3>Wedstrijd ${i + 1}</h3>
+    <div class="match-top"><h3>Wedstrijd ${i + 1}${m.result ? `<span class="count">${esc(resultText(m))}</span>` : ""}</h3>
       <button class="btn ghost danger ${armed === "m-" + m.id ? "armed" : ""}" data-act="m-del" data-mid="${m.id}" data-fk="md-${m.id}">${armed === "m-" + m.id ? "Zeker?" : "Verwijder"}</button></div>
     <div class="match-body">
       <div class="settings">
@@ -446,6 +517,85 @@ function renderResult(m) {
   ${perPlayer && m.mode === "double" ? `<p class="note" style="margin-top:8px">Strokes per speler = verschil met de laagste playing handicap van de vier spelers.</p>` : ""}`;
 }
 
+function resultText(m) {
+  return m.result === "a" ? team("a").name + " wint" : m.result === "b" ? team("b").name + " wint" : m.result === "halved" ? "Gelijk" : "Nog te spelen";
+}
+function sideNames(m, s) {
+  return m[s].map(sl => { const p = playerById(sl.pid); return p ? esc(p.name) : "<span class=\"note\" style=\"display:inline\">?</span>"; }).join(" &amp; ");
+}
+
+function renderOverview() {
+  const ta = team("a"), tb = team("b");
+  const P = allPoints();
+  const lead = P.total.a === P.total.b ? null : P.total.a > P.total.b ? "a" : "b";
+  const diff = Math.abs(P.total.a - P.total.b);
+  const board = `<div class="board totals">
+    <div class="brow"><span class="tn" style="color:var(--boardA)">${esc(ta.name)}</span><span class="tv">${fmtPts(P.total.a)}</span></div>
+    <div class="brow"><span class="tn" style="color:var(--boardB)">${esc(tb.name)}</span><span class="tv">${fmtPts(P.total.b)}</span></div>
+    <div class="bres"><span class="who">${lead ? `${esc(team(lead).name)} leidt met ${fmtPts(diff)} ${diff === 1 ? "punt" : "punten"}` : rounds.length ? "Gelijke stand" : "Nog geen punten verdeeld"}
+      <small>${rounds.length} ${rounds.length === 1 ? "ronde" : "rondes"} · ${rounds.reduce((n, r) => n + roundPoints(r).played, 0)} wedstrijden gespeeld</small></span></div>
+  </div>`;
+  const breakdown = `<div class="scroll"><table class="detail breakdown"><thead><tr><th></th><th class="num" style="color:var(--teamA)">${esc(ta.name)}</th><th class="num" style="color:var(--teamB)">${esc(tb.name)}</th></tr></thead><tbody>
+    <tr><td>Wedstrijden</td><td class="num">${fmtPts(P.match.a)}</td><td class="num">${fmtPts(P.match.b)}</td></tr>
+    <tr><td>Longest drive</td><td class="num">${fmtPts(P.ld.a)}</td><td class="num">${fmtPts(P.ld.b)}</td></tr>
+    <tr><td>Nearest to the pin</td><td class="num">${fmtPts(P.ntp.a)}</td><td class="num">${fmtPts(P.ntp.b)}</td></tr>
+    <tr class="tot"><td>Totaal</td><td class="num">${fmtPts(P.total.a)}</td><td class="num">${fmtPts(P.total.b)}</td></tr>
+  </tbody></table></div>`;
+  if (!rounds.length) return `<h2>Overzicht</h2><div class="stack">${board}
+    <div class="panel empty-state"><p style="margin:0">Nog geen rondes. Maak een ronde aan op <a href="#wedstrijden">Wedstrijden</a>.</p></div></div>`;
+  return `<h2>Overzicht</h2>
+  <p class="help">De totale stand, en per ronde de uitslagen, de longest drive en de nearest to the pins. Een gewonnen wedstrijd levert de punten van die ronde op; bij gelijkspel krijgt elk team de helft.</p>
+  <div class="stack">
+    <div class="overview-top">${board}<div class="panel">${breakdown}</div></div>
+    ${rounds.slice().reverse().map(renderRoundOverview).join("")}
+  </div>`;
+}
+
+function renderRoundOverview(r) {
+  const ta = team("a"), tb = team("b");
+  const p = roundPoints(r);
+  const playerOpts = sel => config.teams.map(t => `<optgroup label="${esc(t.name)}">${t.players.map(pl => `<option value="${pl.id}" ${pl.id === sel ? "selected" : ""}>${esc(pl.name)}</option>`).join("")}</optgroup>`).join("");
+  return `<section class="panel round" aria-label="${esc(roundLabel(r))}">
+    <div class="round-head">
+      <div><h3>${esc(roundLabel(r))}</h3>
+        <p class="note">${fmtPts(r.ptsMatch)} pt per wedstrijd · longest drive ${fmtPts(r.ptsLd)} pt · nearest to the pin ${fmtPts(r.ptsNtp)} pt</p></div>
+      <div class="round-score"><span style="color:var(--teamA)">${fmtPts(p.total.a)}</span><span class="dash">–</span><span style="color:var(--teamB)">${fmtPts(p.total.b)}</span></div>
+    </div>
+    ${r.matches.length ? `<ol class="mlist">${r.matches.map((m, i) => {
+      const won = m.result;
+      const ptsA = won === "a" ? r.ptsMatch : won === "halved" ? r.ptsMatch / 2 : 0;
+      const ptsB = won === "b" ? r.ptsMatch : won === "halved" ? r.ptsMatch / 2 : 0;
+      return `<li class="mrow ${won ? "done" : ""}">
+        <div class="mnum">${i + 1}</div>
+        <div class="mplayers">
+          <span class="pa ${won === "a" ? "win" : ""}">${sideNames(m, "a")}</span>
+          <span class="vs">vs</span>
+          <span class="pb ${won === "b" ? "win" : ""}">${sideNames(m, "b")}</span>
+          <span class="mmeta">${esc(m.formula)}</span>
+        </div>
+        <div class="mres">
+          <select aria-label="Uitslag wedstrijd ${i + 1}" data-fk="res-${m.id}" data-act="m-result" data-mid="${m.id}">
+            <option value="" ${!won ? "selected" : ""}>Nog te spelen</option>
+            <option value="a" ${won === "a" ? "selected" : ""}>${esc(ta.name)} wint</option>
+            <option value="halved" ${won === "halved" ? "selected" : ""}>Gelijk</option>
+            <option value="b" ${won === "b" ? "selected" : ""}>${esc(tb.name)} wint</option>
+          </select>
+          <span class="mpts">${won ? `<span style="color:var(--teamA)">${fmtPts(ptsA)}</span> – <span style="color:var(--teamB)">${fmtPts(ptsB)}</span>` : ""}</span>
+        </div>
+      </li>`; }).join("")}</ol>` : `<p class="note" style="margin:8px 0 0">Nog geen wedstrijden in deze ronde. <a href="#wedstrijden">Stel ze samen</a>.</p>`}
+    <h4 class="sc-title">Longest drive &amp; nearest to the pin</h4>
+    <div class="scroll"><table class="detail contests"><tbody>
+      ${CONTESTS.map(c => { const w = r.contests[c.k]; const wt = w ? team(w.teamId) : null; return `<tr>
+        <td>${c.label}</td>
+        <td><select aria-label="Winnaar ${c.label}" data-fk="sc-${r.id}-${c.k}" data-act="sc-winner" data-rid="${r.id}" data-kind="${c.k}">
+          <option value="">Nog niet bepaald</option>${playerOpts(w ? w.playerId : null)}
+        </select></td>
+        <td class="num">${wt ? `<span style="color:${w.teamId === "a" ? "var(--teamA)" : "var(--teamB)"};font-weight:700">${esc(wt.name)} +${fmtPts(r[c.pts])}</span>` : `<span class="note" style="display:inline">${fmtPts(r[c.pts])} pt</span>`}</td>
+      </tr>`; }).join("")}
+    </tbody></table></div>
+  </section>`;
+}
+
 /* ============================================================
    Gebeurtenissen
    ============================================================ */
@@ -496,9 +646,35 @@ main.addEventListener("change", e => {
     c.tees[el.dataset.tee].slope = v === null ? null : Math.round(v); requestRender(true);
     saveTee(c, el.dataset.tee);
   }
-  else if (act === "day-course") {
-    day.courseId = el.value || null; requestRender(true);
-    run(sb.from("match_day").upsert({ id: 1, course_id: day.courseId }));
+  else if (act === "round-pick") {
+    currentRoundId = el.value; localSet("golf-round", currentRoundId); armed = null; render();
+  }
+  else if (act === "r-course" || act === "r-date" || act === "r-pts") {
+    const r = roundById(el.dataset.rid); if (!r) return;
+    if (act === "r-course") r.courseId = el.value || null;
+    else if (act === "r-date") { if (!el.value) { el.value = r.date; return; } r.date = el.value; }
+    else {
+      const v = num(el.value);
+      if (v === null || v < 0 || v > 999) { el.value = r[el.dataset.field]; setStatus("Geef een aantal punten van 0 of meer in.", true); return; }
+      r[el.dataset.field] = Math.round(v * 10) / 10;
+    }
+    requestRender(true); saveRound(r);
+  }
+  else if (act === "m-result") {
+    const m = findMatch(el.dataset.mid); if (!m) return;
+    m.result = el.value || null; requestRender(true);
+    run(sb.from("matches").update({ result: m.result }).eq("id", m.id));
+  }
+  else if (act === "sc-winner") {
+    const r = roundById(el.dataset.rid); if (!r) return;
+    const kind = el.dataset.kind, p = playerById(el.value);
+    if (p) {
+      r.contests[kind] = { teamId: p.team, playerId: p.id }; requestRender(true);
+      run(sb.from("side_contests").upsert({ round_id: r.id, kind, team_id: p.team, player_id: p.id }, { onConflict: "round_id,kind" }));
+    } else {
+      delete r.contests[kind]; requestRender(true);
+      run(sb.from("side_contests").delete().eq("round_id", r.id).eq("kind", kind));
+    }
   }
   else if (act === "m-formula") {
     const m = findMatch(el.dataset.mid); if (!m) return;
@@ -559,7 +735,7 @@ main.addEventListener("click", async e => {
     const f = findPlayer(el.dataset.pid); if (!f) return;
     const other = config.teams.find(t => t.id !== f.t.id);
     f.t.players.splice(f.i, 1); other.players.push(f.p);
-    const touched = day.matches.filter(m => ["a", "b"].some(s => m[s].some(sl => sl.pid === f.p.id)));
+    const touched = rounds.flatMap(r => r.matches).filter(m => ["a", "b"].some(s => m[s].some(sl => sl.pid === f.p.id)));
     touched.forEach(m => ["a", "b"].forEach(s => m[s].forEach(sl => { if (sl.pid === f.p.id) sl.pid = null; })));
     render();
     await run(sb.from("players").update({ team_id: other.id }).eq("id", f.p.id));
@@ -585,23 +761,41 @@ main.addEventListener("click", async e => {
   else if (act === "c-del") confirmDelete("c-" + el.dataset.cid, () => {
     const id = el.dataset.cid;
     config.courses = config.courses.filter(c => c.id !== id);
-    if (day.courseId === id) day.courseId = null;
+    rounds.forEach(r => { if (r.courseId === id) r.courseId = null; });
     render();
-    run(sb.from("courses").delete().eq("id", id)); // tees worden mee verwijderd, match_day wordt leeg gezet
+    run(sb.from("courses").delete().eq("id", id)); // tees worden mee verwijderd; rondes op deze baan verliezen hun baan
+  });
+
+  else if (act === "r-add") {
+    const prev = currentRound();
+    const r = { id: uuid(), courseId: null, date: todayIso(),
+      ptsMatch: prev ? prev.ptsMatch : 1, ptsLd: prev ? prev.ptsLd : 1, ptsNtp: prev ? prev.ptsNtp : 1, contests: {}, matches: [] };
+    rounds.push(r); currentRoundId = r.id; localSet("golf-round", r.id); render();
+    const c = document.getElementById("r-course"); if (c) c.focus();
+    run(sb.from("rounds").insert({ id: r.id, ...roundRow(r) }));
+  }
+
+  else if (act === "r-del") confirmDelete("r-" + el.dataset.rid, () => {
+    const id = el.dataset.rid;
+    rounds = rounds.filter(r => r.id !== id);
+    if (currentRoundId === id) { currentRoundId = null; localSet("golf-round", null); }
+    render();
+    run(sb.from("rounds").delete().eq("id", id)); // wedstrijden en side contests worden mee verwijderd
   });
 
   else if (act === "m-add") {
+    const round = roundById(el.dataset.rid); if (!round) return;
     const formula = "4BBB";
     const m = { id: uuid(), mode: "double", formula, pct: DEFAULT_PCT[formula],
       a: [{ pid: null, tee: DEFAULT_TEE }, { pid: null, tee: DEFAULT_TEE }],
-      b: [{ pid: null, tee: DEFAULT_TEE }, { pid: null, tee: DEFAULT_TEE }] };
-    day.matches.push(m); render();
-    run(sb.from("matches").insert({ id: m.id, ...matchRow(m) }));
+      b: [{ pid: null, tee: DEFAULT_TEE }, { pid: null, tee: DEFAULT_TEE }], result: null };
+    round.matches.push(m); render();
+    run(sb.from("matches").insert({ id: m.id, round_id: round.id, ...matchRow(m) }));
   }
 
   else if (act === "m-del") confirmDelete("m-" + el.dataset.mid, () => {
     const id = el.dataset.mid;
-    day.matches = day.matches.filter(m => m.id !== id); render();
+    rounds.forEach(r => { r.matches = r.matches.filter(m => m.id !== id); }); render();
     run(sb.from("matches").delete().eq("id", id));
   });
 
